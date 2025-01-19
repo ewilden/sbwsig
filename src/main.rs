@@ -96,7 +96,56 @@ async fn handle_websocket(stream: WebSocket, state: Arc<State>) -> Result<(), Er
     let peer = Peer::new(peer_id, sender);
 
     match initial_message {
-        InitialMessage::Create { mesh } => state.lobbies.handle_create_lobby(peer, mesh).await,
-        InitialMessage::Join { name } => state.lobbies.handle_join_lobby(peer, &name).await,
+        InitialMessage::Create { mesh } => state.lobbies.handle_create_lobby(peer, mesh).await?,
+        InitialMessage::Join { name } => state.lobbies.handle_join_lobby(peer, &name).await?,
     }
+
+    // Next: loop over each incoming message (skip non-text ones other than bailing on binary)
+    // Handle each message using a corresponding call on Lobbies. Mainly we're relaying.
+    // When the websocket close, use the Lobbies stuff to handle close.
+    async fn handle_leaving(peer_id: u32, state: Arc<State>) -> Result<(), Error> {
+        // find lobby by peer & remove peer
+        state.lobbies.handle_close_lobby(peer_id).await;
+        // clean up Peer ID from active peers
+        state
+            .peer_ids
+            .remove(&peer_id)
+            .map_err(|e| eyre!("failed to remove peer: {e}"))?;
+        Ok(())
+    }
+
+    loop {
+        match receiver.next().await {
+            None => break,
+            Some(result) => match result {
+                Ok(message) => match message {
+                    Message::Text(text) => {
+                        if let Err(e) = state.lobbies.handle_message(peer_id, &text).await {
+                            log::error!("error handling message: {e}");
+                            break;
+                        }
+                    }
+                    Message::Binary(_) => {
+                        log::error!("received unexpected binary message");
+                        break;
+                    }
+                    Message::Close(_) => break,
+                    Message::Ping(_) => continue,
+                    Message::Pong(_) => continue,
+                },
+                Err(e) => {
+                    log::error!("error receiving message: {e}");
+                    break;
+                }
+            },
+        }
+    }
+
+    handle_leaving(peer_id, state.clone())
+        .await
+        .unwrap_or_else(|e| {
+            log::error!("error during leave handling: {e}");
+        });
+
+    Ok(())
 }
