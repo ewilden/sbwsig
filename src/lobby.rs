@@ -351,10 +351,18 @@ impl Lobbies {
         // Arbitrary limit for backpressure.
         let (sender, receiver) = mpsc::channel(32);
         vacant_entry.insert_entry(sender);
-        tokio::spawn(
-            self.clone()
-                .new_lobby_task(name, peer.id, peer.websocket, mesh, receiver),
-        );
+        let me = self.clone();
+        tokio::spawn(async move {
+            match me
+                .new_lobby_task(name, peer.id, peer.websocket, mesh, receiver)
+                .await
+            {
+                Ok(()) => (),
+                Err(e) => {
+                    log::error!("lobby task exited with error {e:?}");
+                }
+            }
+        });
         Ok(())
     }
 
@@ -366,29 +374,9 @@ impl Lobbies {
 
         Ok(())
     }
-
-    // pub(crate) async fn handle_seal(&mut self, peer_id: u32, name: &str) -> Result<(), Error> {
-    //     let Some(mut lobby) = self.0.lobbies.get_async(name).await else {
-    //         return Err(eyre!("no such lobby {name}"));
-    //     };
-    //     let SealedLobby = lobby.get_mut().seal(peer_id).await?;
-    //     // TODO: handle SealedLobby
-    //     Ok(())
-    // }
-
-    // pub(crate) async fn handle_relay_message(
-    //     &mut self,
-    //     relay_message: RelayMessage,
-    //     name: &str,
-    // ) -> Result<(), Error> {
-    //     let Some(mut lobby) = self.0.lobbies.get_async(name).await else {
-    //         return Err(eyre!("no such lobby {name}"));
-    //     };
-    //     lobby.relay(relay_message).await
-    // }
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub(crate) enum InitialMessage {
     Create { mesh: bool },
     Join { name: String },

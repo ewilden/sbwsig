@@ -1,6 +1,10 @@
 mod lobby;
 
-use std::sync::Arc;
+use std::{
+    env::{self, VarError},
+    fs,
+    sync::Arc,
+};
 
 use axum::{
     extract::{
@@ -15,8 +19,8 @@ use color_eyre::eyre::eyre;
 use color_eyre::eyre::Context as _;
 use color_eyre::eyre::Error;
 use futures::{channel::mpsc, StreamExt};
+use schemars::schema_for;
 use shuttle_axum::ShuttleAxum;
-use tokio::sync::Mutex;
 use tower_http::services::ServeDir;
 
 use lobby::{CleanupWorkItem, InitialMessage, Lobbies, LobbiesInner};
@@ -62,7 +66,15 @@ impl State {
 
 #[shuttle_runtime::main]
 async fn main() -> ShuttleAxum {
-    let state = Arc::new(Mutex::new(State::new()));
+    if env::var("WRITE_SCHEMA") != Err(VarError::NotPresent) {
+        fs::write(
+            "schemas.txt",
+            serde_json::to_string_pretty(&InitialMessage::Create { mesh: true }).unwrap(),
+        )
+        .expect("should succeed")
+    }
+
+    let state = Arc::new(State::new());
 
     let router = Router::new()
         .route("/websocket", get(websocket_handler))
@@ -89,6 +101,7 @@ async fn websocket(stream: WebSocket, state: Arc<State>) {
 }
 
 async fn handle_websocket(mut socket: WebSocket, state: Arc<State>) -> Result<(), Error> {
+    log::info!("handle_websocket");
     // By splitting we can send and receive at the same time.
     let initial_message = loop {
         let message = match socket.next().await {
