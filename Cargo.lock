@@ -1785,6 +1785,7 @@ dependencies = [
  "shuttle-axum",
  "shuttle-runtime",
  "tokio",
+ "tokio-stream",
  "tower-http",
 ]
 

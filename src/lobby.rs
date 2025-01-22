@@ -1,13 +1,17 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use color_eyre::eyre::eyre;
 use color_eyre::eyre::Context as _;
 use color_eyre::eyre::Error;
+use futures::channel::mpsc;
 use futures::stream::SplitSink;
 use futures::SinkExt as _;
+use futures::StreamExt;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
+use tokio_stream::StreamMap;
 
 pub(crate) struct Peer {
     id: u32,
@@ -33,21 +37,23 @@ pub(crate) struct Lobby {
     host: u32,
     mesh: bool,
     peers: BTreeMap<u32, Peer>,
-    sealed: bool,
 }
 
 impl Lobby {
-    fn new(host: u32, mesh: bool) -> Self {
+    fn new_name() -> String {
+        rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect::<String>()
+    }
+
+    fn new(name: String, host: u32, mesh: bool) -> Self {
         Lobby {
-            name: rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(16)
-                .map(char::from)
-                .collect::<String>(),
+            name,
             host,
             mesh,
             peers: Default::default(),
-            sealed: false,
         }
     }
     fn get_peer_id(host: u32, peer: &Peer) -> u32 {
@@ -110,26 +116,6 @@ impl Lobby {
         Ok((None, leaving_peer))
     }
 
-    async fn seal(&mut self, peer_id: u32) -> Result<SealedLobby, Error> {
-        let host = self.host;
-        if host != peer_id {
-            return Err(eyre!("only the host can seal"));
-        }
-        self.sealed = true;
-        for (_, peer) in &mut self.peers {
-            peer.send(&LobbyMessage {
-                payload: LobbyPayload::Seal,
-            })
-            .await?;
-        }
-        log::info!(
-            "Peer {peer_id} sealed lobby {} with {} peers",
-            &self.name,
-            self.peers.len()
-        );
-        Ok(SealedLobby)
-    }
-
     async fn relay(&mut self, relay_message: RelayMessage) -> Result<(), Error> {
         let RelayMessage {
             kind,
@@ -151,14 +137,6 @@ impl Lobby {
 /// from the lobby and close all their websockets.
 #[must_use]
 struct CloseLobby;
-
-/// If we receive this, the lobby has been sealed and
-/// we should close all the connections once we're
-/// confident everybody has joined.
-/// TODO: Perhaps remove this functionality if we want
-/// people to be able to join a lobby midway through.
-#[must_use]
-struct SealedLobby;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct LobbyMessage {
@@ -208,66 +186,206 @@ pub(crate) struct RelayMessage {
     data: String,
 }
 
-#[derive(Default)]
-pub(crate) struct Lobbies {
-    lobbies: scc::HashMap<String, Lobby>,
+pub(crate) struct NewPeer {
+    pub(crate) id: u32,
+    pub(crate) websocket: WebSocket,
 }
 
-impl Lobbies {
-    pub(crate) async fn handle_create_lobby(
-        &self,
-        mut peer: Peer,
-        mesh: bool,
-    ) -> Result<(), Error> {
-        let mut occupied_entry = loop {
-            let lobby = Lobby::new(peer.id, mesh);
-            let entry = self.lobbies.entry_async(lobby.name.clone()).await;
-            match entry {
-                scc::hash_map::Entry::Occupied(_) => continue,
-                scc::hash_map::Entry::Vacant(vacant_entry) => {
-                    break vacant_entry.insert_entry(lobby)
-                }
+enum LobbyWorkItem {
+    NewPeer(NewPeer),
+    PeerMessage((u32, Option<Result<Message, axum::Error>>)),
+}
+
+pub(crate) enum CleanupWorkItem {
+    DeleteLobby(String),
+}
+
+pub(crate) struct LobbiesInner {
+    pub(crate) lobbies: scc::HashMap<String, mpsc::Sender<NewPeer>>,
+    pub(crate) cleanup: mpsc::UnboundedSender<CleanupWorkItem>,
+}
+
+struct ClearLobbyOnDrop {
+    lobbies: Lobbies,
+    lobby_name: String,
+}
+
+impl Drop for ClearLobbyOnDrop {
+    fn drop(&mut self) {
+        let Self {
+            lobbies,
+            lobby_name,
+        } = self;
+        match lobbies
+            .0
+            .cleanup
+            .unbounded_send(CleanupWorkItem::DeleteLobby(lobby_name.clone()))
+        {
+            Ok(_) => (),
+            Err(e) => {
+                log::error!("cleanup receiver was dropped: {e:?}")
             }
-        };
-        let lobby = occupied_entry.get_mut();
-        peer.send(&LobbyMessage {
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Lobbies(pub(crate) Arc<LobbiesInner>);
+
+impl Lobbies {
+    async fn new_lobby_task(
+        self,
+        name: String,
+        host_id: u32,
+        host_ws: WebSocket,
+        mesh: bool,
+        mut peer_receiver: mpsc::Receiver<NewPeer>,
+    ) -> Result<(), Error> {
+        let mut lobby = Lobby::new(name, host_id, mesh);
+        let mut peer_rx = StreamMap::<u32, _>::new().fuse();
+        let (host_tx, host_rx) = host_ws.split();
+        peer_rx.get_mut().insert(
+            host_id,
+            host_rx
+                .map(Some)
+                .chain(futures::stream::once(futures::future::ready(None))),
+        );
+        let mut host = Peer::new(host_id, host_tx);
+        host.send(&LobbyMessage {
             payload: LobbyPayload::CreatedLobby {
                 name: lobby.name.clone(),
             },
         })
         .await?;
-        lobby.join(peer).await?;
+        lobby.join(host).await?;
+
+        let _cleanup = ClearLobbyOnDrop {
+            lobbies: self.clone(),
+            lobby_name: lobby.name.clone(),
+        };
+
+        loop {
+            let work_item = futures::select! {
+                opt_rx = peer_rx.next() => {
+                    LobbyWorkItem::PeerMessage(opt_rx.expect("should not have ended"))
+                }
+                new_peer = peer_receiver.next() => {
+                    LobbyWorkItem::NewPeer(new_peer.expect("new peer receiver should not exit"))
+                }
+            };
+            match work_item {
+                LobbyWorkItem::NewPeer(new_peer) => {
+                    let NewPeer { id, websocket } = new_peer;
+                    let (tx, rx) = websocket.split();
+                    peer_rx.get_mut().insert(
+                        id,
+                        rx.map(Some)
+                            .chain(futures::stream::once(futures::future::ready(None))),
+                    );
+                    let peer = Peer::new(id, tx);
+                    lobby.join(peer).await?;
+                }
+                LobbyWorkItem::PeerMessage((id, opt_rx_result)) => {
+                    match opt_rx_result {
+                        None => {
+                            // Peer hung up on us.
+                            // Remove it from the map.
+                            let _ = peer_rx.get_mut().remove(&id);
+                            // We're leaving!
+                            let (close, _peer) = lobby.leave(id).await?;
+                            if let Some(CloseLobby) = close {
+                                // The lobby is closed, hang up on everybody.
+                                log::info!("closing lobby {}", lobby.name);
+                                return Ok(());
+                            }
+                        }
+                        Some(result) => match result {
+                            Err(e) => {
+                                log::error!("error receiving: {e:?}");
+                                // Peer errored.
+                                // Remove it from the map.
+                                let _ = peer_rx.get_mut().remove(&id);
+                                // We're leaving!
+                                let (close, _peer) = lobby.leave(id).await?;
+                                if let Some(CloseLobby) = close {
+                                    // The lobby is closed, hang up on everybody.
+                                    log::info!("closing lobby {}", lobby.name);
+                                    return Ok(());
+                                }
+                            }
+                            Ok(message) => match message {
+                                Message::Text(message) => {
+                                    // All remaining messages should be relay messages.
+                                    let relay_message: RelayMessage =
+                                        serde_json::from_str(message.as_str())
+                                            .context("failed to parse as RelayMessage")?;
+                                    lobby.relay(relay_message).await?;
+                                }
+                                Message::Binary(_vec) => {
+                                    // Wrong! Hang up on the peer.
+                                    // For now just ignore.
+                                    log::debug!("ignoring binary msg")
+                                }
+                                Message::Ping(_) => (),
+                                Message::Pong(_) => (),
+                                Message::Close(_) => (),
+                            },
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn handle_create_lobby(&self, peer: NewPeer, mesh: bool) -> Result<(), Error> {
+        let (name, vacant_entry) = loop {
+            let name = Lobby::new_name();
+            let entry = self.0.lobbies.entry_async(name.clone()).await;
+            match entry {
+                scc::hash_map::Entry::Occupied(_) => continue,
+                scc::hash_map::Entry::Vacant(vacant_entry) => {
+                    break (name, vacant_entry);
+                }
+            }
+        };
+        // Arbitrary limit for backpressure.
+        let (sender, receiver) = mpsc::channel(32);
+        vacant_entry.insert_entry(sender);
+        tokio::spawn(
+            self.clone()
+                .new_lobby_task(name, peer.id, peer.websocket, mesh, receiver),
+        );
         Ok(())
     }
 
-    pub(crate) async fn handle_join_lobby(&self, peer: Peer, name: &str) -> Result<(), Error> {
-        let Some(mut lobby) = self.lobbies.get_async(name).await else {
+    pub(crate) async fn handle_join_lobby(&self, peer: NewPeer, name: &str) -> Result<(), Error> {
+        let Some(mut lobby) = self.0.lobbies.get_async(name).await else {
             return Err(eyre!("no such lobby {name}"));
         };
-        lobby.join(peer).await?;
+        lobby.get_mut().send(peer).await?;
 
         Ok(())
     }
 
-    pub(crate) async fn handle_seal(&mut self, peer_id: u32, name: &str) -> Result<(), Error> {
-        let Some(mut lobby) = self.lobbies.get_async(name).await else {
-            return Err(eyre!("no such lobby {name}"));
-        };
-        let SealedLobby = lobby.seal(peer_id).await?;
-        // TODO: handle SealedLobby
-        Ok(())
-    }
+    // pub(crate) async fn handle_seal(&mut self, peer_id: u32, name: &str) -> Result<(), Error> {
+    //     let Some(mut lobby) = self.0.lobbies.get_async(name).await else {
+    //         return Err(eyre!("no such lobby {name}"));
+    //     };
+    //     let SealedLobby = lobby.get_mut().seal(peer_id).await?;
+    //     // TODO: handle SealedLobby
+    //     Ok(())
+    // }
 
-    pub(crate) async fn handle_relay_message(
-        &mut self,
-        relay_message: RelayMessage,
-        name: &str,
-    ) -> Result<(), Error> {
-        let Some(mut lobby) = self.lobbies.get_async(name).await else {
-            return Err(eyre!("no such lobby {name}"));
-        };
-        lobby.relay(relay_message).await
-    }
+    // pub(crate) async fn handle_relay_message(
+    //     &mut self,
+    //     relay_message: RelayMessage,
+    //     name: &str,
+    // ) -> Result<(), Error> {
+    //     let Some(mut lobby) = self.0.lobbies.get_async(name).await else {
+    //         return Err(eyre!("no such lobby {name}"));
+    //     };
+    //     lobby.relay(relay_message).await
+    // }
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]

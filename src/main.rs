@@ -1,6 +1,6 @@
 mod lobby;
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use axum::{
     extract::{
@@ -11,28 +11,44 @@ use axum::{
     routing::get,
     Extension, Router,
 };
-use chrono::{DateTime, Utc};
 use color_eyre::eyre::eyre;
 use color_eyre::eyre::Context as _;
 use color_eyre::eyre::Error;
-use futures::{SinkExt, StreamExt};
-use serde::Serialize;
+use futures::{channel::mpsc, StreamExt};
 use shuttle_axum::ShuttleAxum;
-use tokio::{
-    sync::{watch, Mutex},
-    time::sleep,
-};
+use tokio::sync::Mutex;
 use tower_http::services::ServeDir;
 
-use lobby::{InitialMessage, Lobbies, Peer};
+use lobby::{CleanupWorkItem, InitialMessage, Lobbies, LobbiesInner};
 
-#[derive(Default)]
 struct State {
     lobbies: Lobbies,
     peer_ids: scc::HashSet<u32>,
+    _cleanup_work: tokio::task::JoinHandle<()>,
 }
 
 impl State {
+    fn new() -> Self {
+        let (sender, mut receiver) = mpsc::unbounded();
+        let lobbies = Lobbies(Arc::new(LobbiesInner {
+            lobbies: Default::default(),
+            cleanup: sender,
+        }));
+        Self {
+            lobbies: lobbies.clone(),
+            peer_ids: Default::default(),
+            _cleanup_work: tokio::spawn(async move {
+                while let Some(work) = receiver.next().await {
+                    match work {
+                        CleanupWorkItem::DeleteLobby(lobby_name) => {
+                            lobbies.0.lobbies.remove_async(&lobby_name).await;
+                        }
+                    }
+                }
+            }),
+        }
+    }
+
     fn allocate_peer(&self) -> u32 {
         loop {
             let peer_id = rand::random::<u32>();
@@ -46,7 +62,7 @@ impl State {
 
 #[shuttle_runtime::main]
 async fn main() -> ShuttleAxum {
-    let state = Arc::new(Mutex::new(State::default()));
+    let state = Arc::new(Mutex::new(State::new()));
 
     let router = Router::new()
         .route("/websocket", get(websocket_handler))
@@ -72,12 +88,10 @@ async fn websocket(stream: WebSocket, state: Arc<State>) {
     }
 }
 
-async fn handle_websocket(stream: WebSocket, state: Arc<State>) -> Result<(), Error> {
+async fn handle_websocket(mut socket: WebSocket, state: Arc<State>) -> Result<(), Error> {
     // By splitting we can send and receive at the same time.
-    let (sender, mut receiver) = stream.split();
-
     let initial_message = loop {
-        let message = match receiver.next().await {
+        let message = match socket.next().await {
             None => return Ok(()),
             Some(result) => result.context("error receiving initial message")?,
         };
@@ -93,59 +107,14 @@ async fn handle_websocket(stream: WebSocket, state: Arc<State>) -> Result<(), Er
     };
 
     let peer_id = state.allocate_peer();
-    let peer = Peer::new(peer_id, sender);
+    let peer = lobby::NewPeer {
+        id: peer_id,
+        websocket: socket,
+    };
 
     match initial_message {
         InitialMessage::Create { mesh } => state.lobbies.handle_create_lobby(peer, mesh).await?,
         InitialMessage::Join { name } => state.lobbies.handle_join_lobby(peer, &name).await?,
     }
-
-    // Next: loop over each incoming message (skip non-text ones other than bailing on binary)
-    // Handle each message using a corresponding call on Lobbies. Mainly we're relaying.
-    // When the websocket close, use the Lobbies stuff to handle close.
-    async fn handle_leaving(peer_id: u32, state: Arc<State>) -> Result<(), Error> {
-        // find lobby by peer & remove peer
-        state.lobbies.handle_close_lobby(peer_id).await;
-        // clean up Peer ID from active peers
-        state
-            .peer_ids
-            .remove(&peer_id)
-            .map_err(|e| eyre!("failed to remove peer: {e}"))?;
-        Ok(())
-    }
-
-    loop {
-        match receiver.next().await {
-            None => break,
-            Some(result) => match result {
-                Ok(message) => match message {
-                    Message::Text(text) => {
-                        if let Err(e) = state.lobbies.handle_message(peer_id, &text).await {
-                            log::error!("error handling message: {e}");
-                            break;
-                        }
-                    }
-                    Message::Binary(_) => {
-                        log::error!("received unexpected binary message");
-                        break;
-                    }
-                    Message::Close(_) => break,
-                    Message::Ping(_) => continue,
-                    Message::Pong(_) => continue,
-                },
-                Err(e) => {
-                    log::error!("error receiving message: {e}");
-                    break;
-                }
-            },
-        }
-    }
-
-    handle_leaving(peer_id, state.clone())
-        .await
-        .unwrap_or_else(|e| {
-            log::error!("error during leave handling: {e}");
-        });
-
     Ok(())
 }
