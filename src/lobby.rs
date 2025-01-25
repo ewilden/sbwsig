@@ -5,21 +5,24 @@ use axum::extract::ws::{Message, WebSocket};
 use color_eyre::eyre::eyre;
 use color_eyre::eyre::Context as _;
 use color_eyre::eyre::Error;
-use futures::channel::mpsc;
+use derivative::Derivative;
 use futures::stream::SplitSink;
+use futures::FutureExt as _;
 use futures::SinkExt as _;
 use futures::StreamExt;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
+use tokio::sync::mpsc;
 use tokio_stream::StreamMap;
 
-pub(crate) struct Peer {
+use crate::Socket;
+pub(crate) struct Peer<S: Socket> {
     id: u32,
-    websocket: SplitSink<WebSocket, Message>,
+    websocket: SplitSink<S, Message>,
 }
 
-impl Peer {
-    pub(crate) fn new(id: u32, websocket: SplitSink<WebSocket, Message>) -> Self {
+impl<S: Socket> Peer<S> {
+    pub(crate) fn new(id: u32, websocket: SplitSink<S, Message>) -> Self {
         Self { id, websocket }
     }
     async fn send(&mut self, msg: &LobbyMessage) -> Result<(), Error> {
@@ -32,14 +35,14 @@ impl Peer {
     }
 }
 
-pub(crate) struct Lobby {
+pub(crate) struct Lobby<S: Socket> {
     name: String,
     host: u32,
     mesh: bool,
-    peers: BTreeMap<u32, Peer>,
+    peers: BTreeMap<u32, Peer<S>>,
 }
 
-impl Lobby {
+impl<S: Socket> Lobby<S> {
     fn new_name() -> String {
         rand::thread_rng()
             .sample_iter(&Alphanumeric)
@@ -56,7 +59,7 @@ impl Lobby {
             peers: Default::default(),
         }
     }
-    fn get_peer_id(host: u32, peer: &Peer) -> u32 {
+    fn get_peer_id(host: u32, peer: &Peer<S>) -> u32 {
         if host == peer.id {
             1
         } else {
@@ -64,7 +67,7 @@ impl Lobby {
         }
     }
 
-    async fn join(&mut self, mut new_peer: Peer) -> Result<(), Error> {
+    async fn join(&mut self, mut new_peer: Peer<S>) -> Result<(), Error> {
         let host = self.host;
         let assigned = Self::get_peer_id(host, &new_peer);
         new_peer
@@ -92,7 +95,7 @@ impl Lobby {
         Ok(())
     }
 
-    async fn leave(&mut self, peer_id: u32) -> Result<(Option<CloseLobby>, Peer), Error> {
+    async fn leave(&mut self, peer_id: u32) -> Result<(Option<CloseLobby>, Peer<S>), Error> {
         let host = self.host;
         let Some(leaving_peer) = self.peers.remove(&peer_id) else {
             return Err(eyre!(
@@ -186,13 +189,13 @@ pub(crate) struct RelayMessage {
     data: String,
 }
 
-pub(crate) struct NewPeer {
+pub(crate) struct NewPeer<S: Socket> {
     pub(crate) id: u32,
-    pub(crate) websocket: WebSocket,
+    pub(crate) websocket: S,
 }
 
-enum LobbyWorkItem {
-    NewPeer(NewPeer),
+enum LobbyWorkItem<S: Socket> {
+    NewPeer(NewPeer<S>),
     PeerMessage((u32, Option<Result<Message, axum::Error>>)),
 }
 
@@ -200,17 +203,17 @@ pub(crate) enum CleanupWorkItem {
     DeleteLobby(String),
 }
 
-pub(crate) struct LobbiesInner {
-    pub(crate) lobbies: scc::HashMap<String, mpsc::Sender<NewPeer>>,
+pub(crate) struct LobbiesInner<S: Socket> {
+    pub(crate) lobbies: scc::HashMap<String, mpsc::Sender<NewPeer<S>>>,
     pub(crate) cleanup: mpsc::UnboundedSender<CleanupWorkItem>,
 }
 
-struct ClearLobbyOnDrop {
-    lobbies: Lobbies,
+struct ClearLobbyOnDrop<S: Socket> {
+    lobbies: Lobbies<S>,
     lobby_name: String,
 }
 
-impl Drop for ClearLobbyOnDrop {
+impl<S: Socket> Drop for ClearLobbyOnDrop<S> {
     fn drop(&mut self) {
         let Self {
             lobbies,
@@ -219,7 +222,7 @@ impl Drop for ClearLobbyOnDrop {
         match lobbies
             .0
             .cleanup
-            .unbounded_send(CleanupWorkItem::DeleteLobby(lobby_name.clone()))
+            .send(CleanupWorkItem::DeleteLobby(lobby_name.clone()))
         {
             Ok(_) => (),
             Err(e) => {
@@ -229,17 +232,18 @@ impl Drop for ClearLobbyOnDrop {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct Lobbies(pub(crate) Arc<LobbiesInner>);
+#[derive(Derivative)]
+#[derivative(Clone(bound = ""))]
+pub(crate) struct Lobbies<S: Socket>(pub(crate) Arc<LobbiesInner<S>>);
 
-impl Lobbies {
+impl<S: Socket> Lobbies<S> {
     async fn new_lobby_task(
         self,
         name: String,
         host_id: u32,
-        host_ws: WebSocket,
+        host_ws: S,
         mesh: bool,
-        mut peer_receiver: mpsc::Receiver<NewPeer>,
+        mut peer_receiver: mpsc::Receiver<NewPeer<S>>,
     ) -> Result<(), Error> {
         let mut lobby = Lobby::new(name, host_id, mesh);
         let mut peer_rx = StreamMap::<u32, _>::new().fuse();
@@ -265,12 +269,19 @@ impl Lobbies {
         };
 
         loop {
-            let work_item = futures::select! {
-                opt_rx = peer_rx.next() => {
-                    LobbyWorkItem::PeerMessage(opt_rx.expect("should not have ended"))
-                }
-                new_peer = peer_receiver.next() => {
-                    LobbyWorkItem::NewPeer(new_peer.expect("new peer receiver should not exit"))
+            let work_item = {
+                let mut peer_rx = peer_rx.by_ref().chain(futures::stream::pending());
+                futures::select! {
+                    opt_rx = peer_rx.next() => {
+                        LobbyWorkItem::PeerMessage(opt_rx.expect("should not have ended"))
+                    }
+                    new_peer = peer_receiver.recv().fuse() => {
+                        let Some(new_peer) = new_peer else {
+                            log::info!("exiting because new-peer receiver was dropped");
+                            return Ok(())
+                        };
+                        LobbyWorkItem::NewPeer(new_peer)
+                    }
                 }
             };
             match work_item {
@@ -337,9 +348,13 @@ impl Lobbies {
         }
     }
 
-    pub(crate) async fn handle_create_lobby(&self, peer: NewPeer, mesh: bool) -> Result<(), Error> {
+    pub(crate) async fn handle_create_lobby(
+        &self,
+        peer: NewPeer<S>,
+        mesh: bool,
+    ) -> Result<(), Error> {
         let (name, vacant_entry) = loop {
-            let name = Lobby::new_name();
+            let name = Lobby::<S>::new_name();
             let entry = self.0.lobbies.entry_async(name.clone()).await;
             match entry {
                 scc::hash_map::Entry::Occupied(_) => continue,
@@ -366,17 +381,25 @@ impl Lobbies {
         Ok(())
     }
 
-    pub(crate) async fn handle_join_lobby(&self, peer: NewPeer, name: &str) -> Result<(), Error> {
+    pub(crate) async fn handle_join_lobby(
+        &self,
+        peer: NewPeer<S>,
+        name: &str,
+    ) -> Result<(), Error> {
         let Some(mut lobby) = self.0.lobbies.get_async(name).await else {
             return Err(eyre!("no such lobby {name}"));
         };
-        lobby.get_mut().send(peer).await?;
+        lobby
+            .get_mut()
+            .send(peer)
+            .await
+            .map_err(|e| eyre!("error sending peer to lobby: {e:?}"))?;
 
         Ok(())
     }
 }
 
-#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+#[derive(serde::Deserialize, serde::Serialize)]
 pub(crate) enum InitialMessage {
     Create { mesh: bool },
     Join { name: String },

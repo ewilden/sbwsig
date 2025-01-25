@@ -18,22 +18,22 @@ use axum::{
 use color_eyre::eyre::eyre;
 use color_eyre::eyre::Context as _;
 use color_eyre::eyre::Error;
-use futures::{channel::mpsc, StreamExt};
-use schemars::schema_for;
+use futures::{Sink, Stream, StreamExt};
 use shuttle_axum::ShuttleAxum;
+use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 
 use lobby::{CleanupWorkItem, InitialMessage, Lobbies, LobbiesInner};
 
-struct State {
-    lobbies: Lobbies,
+struct State<S: Socket> {
+    lobbies: Lobbies<S>,
     peer_ids: scc::HashSet<u32>,
     _cleanup_work: tokio::task::JoinHandle<()>,
 }
 
-impl State {
+impl<S: Socket> State<S> {
     fn new() -> Self {
-        let (sender, mut receiver) = mpsc::unbounded();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
         let lobbies = Lobbies(Arc::new(LobbiesInner {
             lobbies: Default::default(),
             cleanup: sender,
@@ -42,7 +42,7 @@ impl State {
             lobbies: lobbies.clone(),
             peer_ids: Default::default(),
             _cleanup_work: tokio::spawn(async move {
-                while let Some(work) = receiver.next().await {
+                while let Some(work) = receiver.recv().await {
                     match work {
                         CleanupWorkItem::DeleteLobby(lobby_name) => {
                             lobbies.0.lobbies.remove_async(&lobby_name).await;
@@ -74,7 +74,7 @@ async fn main() -> ShuttleAxum {
         .expect("should succeed")
     }
 
-    let state = Arc::new(State::new());
+    let state = Arc::new(State::<WebSocket>::new());
 
     let router = Router::new()
         .route("/websocket", get(websocket_handler))
@@ -86,12 +86,12 @@ async fn main() -> ShuttleAxum {
 
 async fn websocket_handler(
     ws: WebSocketUpgrade,
-    Extension(state): Extension<Arc<State>>,
+    Extension(state): Extension<Arc<State<WebSocket>>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|socket| websocket(socket, state))
 }
 
-async fn websocket(stream: WebSocket, state: Arc<State>) {
+async fn websocket(stream: WebSocket, state: Arc<State<WebSocket>>) {
     match handle_websocket(stream, state).await {
         Ok(()) => (),
         Err(e) => {
@@ -100,9 +100,8 @@ async fn websocket(stream: WebSocket, state: Arc<State>) {
     }
 }
 
-async fn handle_websocket(mut socket: WebSocket, state: Arc<State>) -> Result<(), Error> {
+async fn handle_websocket<S: Socket>(mut socket: S, state: Arc<State<S>>) -> Result<(), Error> {
     log::info!("handle_websocket");
-    // By splitting we can send and receive at the same time.
     let initial_message = loop {
         let message = match socket.next().await {
             None => return Ok(()),
@@ -130,4 +129,33 @@ async fn handle_websocket(mut socket: WebSocket, state: Arc<State>) -> Result<()
         InitialMessage::Join { name } => state.lobbies.handle_join_lobby(peer, &name).await?,
     }
     Ok(())
+}
+
+trait Socket:
+    'static
+    + Send
+    + Unpin
+    + Sink<Message, Error = axum::Error>
+    + Stream<Item = Result<Message, axum::Error>>
+{
+}
+impl<
+        T: 'static
+            + Send
+            + Unpin
+            + Sink<Message, Error = axum::Error>
+            + Stream<Item = Result<Message, axum::Error>>,
+    > Socket for T
+{
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    // #[test]
+    // fn basic_functionality() {
+    //     let state = Arc::new(State::new());
+    // }
+    // let websocket = WebSocket::
 }
