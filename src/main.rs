@@ -151,7 +151,83 @@ impl<
 
 #[cfg(test)]
 mod test {
+    use std::{pin::Pin, task::Poll};
+
     use super::*;
+    use axum::extract::ws::Message;
+    use tokio::sync::mpsc;
+
+    struct TestSocket {
+        sender: mpsc::UnboundedSender<Message>,
+        receiver: mpsc::UnboundedReceiver<Result<Message, axum::Error>>,
+    }
+
+    impl TestSocket {
+        fn new_pair() -> (Self, TestSocketOtherEnd) {
+            let (sender, other_receiver) = mpsc::unbounded_channel();
+            let (other_sender, receiver) = mpsc::unbounded_channel();
+
+            (
+                TestSocket { sender, receiver },
+                TestSocketOtherEnd {
+                    sender: other_sender,
+                    receiver: other_receiver,
+                },
+            )
+        }
+    }
+
+    struct TestSocketOtherEnd {
+        sender: mpsc::UnboundedSender<Result<Message, axum::Error>>,
+        receiver: mpsc::UnboundedReceiver<Message>,
+    }
+
+    impl Stream for TestSocket {
+        type Item = Result<Message, axum::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.receiver.poll_recv(cx)
+        }
+    }
+
+    impl Sink<Message> for TestSocket {
+        type Error = axum::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.sender.send(item).expect("should succeed");
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn _impls_socket() {
+        let (test_socket, _other_end) = TestSocket::new_pair();
+        let _socket: &dyn Socket = &test_socket;
+    }
+    // impl Socket for TestSocket {}
 
     // #[test]
     // fn basic_functionality() {
