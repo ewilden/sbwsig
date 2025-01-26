@@ -20,7 +20,7 @@ use color_eyre::eyre::Context as _;
 use color_eyre::eyre::Error;
 use futures::{Sink, Stream, StreamExt};
 use shuttle_axum::ShuttleAxum;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tower_http::services::ServeDir;
 
 use lobby::{CleanupWorkItem, InitialMessage, Lobbies, LobbiesInner};
@@ -93,18 +93,26 @@ async fn websocket_handler(
 
 async fn websocket(stream: WebSocket, state: Arc<State<WebSocket>>) {
     match handle_websocket(stream, state).await {
-        Ok(()) => (),
+        Ok(opt_join_handle) => {
+            if let Some(join_handle) = opt_join_handle {
+                // Dropping this will not abort the task.
+                let _: JoinHandle<()> = join_handle;
+            }
+        }
         Err(e) => {
             log::error!("{e:?}");
         }
     }
 }
 
-async fn handle_websocket<S: Socket>(mut socket: S, state: Arc<State<S>>) -> Result<(), Error> {
+async fn handle_websocket<S: Socket>(
+    mut socket: S,
+    state: Arc<State<S>>,
+) -> Result<Option<JoinHandle<()>>, Error> {
     log::info!("handle_websocket");
     let initial_message = loop {
         let message = match socket.next().await {
-            None => return Ok(()),
+            None => return Ok(None),
             Some(result) => result.context("error receiving initial message")?,
         };
         let message = match message {
@@ -124,11 +132,15 @@ async fn handle_websocket<S: Socket>(mut socket: S, state: Arc<State<S>>) -> Res
         websocket: socket,
     };
 
-    match initial_message {
-        InitialMessage::Create { mesh } => state.lobbies.handle_create_lobby(peer, mesh).await?,
-        InitialMessage::Join { name } => state.lobbies.handle_join_lobby(peer, &name).await?,
-    }
-    Ok(())
+    Ok(match initial_message {
+        InitialMessage::Create { mesh } => {
+            Some(state.lobbies.handle_create_lobby(peer, mesh).await?)
+        }
+        InitialMessage::Join { name } => {
+            state.lobbies.handle_join_lobby(peer, &name).await?;
+            None
+        }
+    })
 }
 
 trait Socket:
@@ -155,6 +167,7 @@ mod test {
 
     use super::*;
     use axum::extract::ws::Message;
+    use serde_json::json;
     use tokio::sync::mpsc;
 
     struct TestSocket {
@@ -189,7 +202,13 @@ mod test {
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Self::Item>> {
-            self.receiver.poll_recv(cx)
+            match self.receiver.poll_recv(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(received) => {
+                    eprintln!("test socket received: {received:#?}");
+                    Poll::Ready(received)
+                }
+            }
         }
     }
 
@@ -204,8 +223,8 @@ mod test {
         }
 
         fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-            self.sender.send(item).expect("should succeed");
-            Ok(())
+            eprintln!("test socket sending: {item:#?}");
+            self.sender.send(item).map_err(|err| axum::Error::new(err))
         }
 
         fn poll_flush(
@@ -227,11 +246,123 @@ mod test {
         let (test_socket, _other_end) = TestSocket::new_pair();
         let _socket: &dyn Socket = &test_socket;
     }
-    // impl Socket for TestSocket {}
 
-    // #[test]
-    // fn basic_functionality() {
-    //     let state = Arc::new(State::new());
-    // }
-    // let websocket = WebSocket::
+    #[tokio::test]
+    async fn handles_open_close() {
+        let state = Arc::new(State::new());
+        let (socket, fixture) = TestSocket::new_pair();
+        let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
+        drop(fixture);
+        if let Some(join_handle) = handler_task
+            .await
+            .expect("should complete normally")
+            .expect("should not get error")
+        {
+            join_handle.await.expect("should complete normally")
+        }
+        assert!(state.lobbies.0.lobbies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn basic_functionality() {
+        let state = Arc::new(State::new());
+        let (socket, mut fixture) = TestSocket::new_pair();
+        let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
+        fixture
+            .sender
+            .send(Ok(Message::Text(
+                serde_json::to_string(&InitialMessage::Create { mesh: false })
+                    .expect("should serialize successfully"),
+            )))
+            .expect("should succeed");
+        let received = fixture
+            .receiver
+            .recv()
+            .await
+            .expect("should receive")
+            .into_text()
+            .expect("should be text");
+        let received = serde_json::from_str::<serde_json::Value>(&received)
+            .expect("should parse JSON successfully");
+        let lobby_name = received["payload"]["CreatedLobby"]["name"]
+            .as_str()
+            .expect("should be string");
+        assert_eq!(
+            received,
+            json!({
+                "payload": {
+                    "CreatedLobby": {
+                        "name": lobby_name
+                    }
+                }
+            })
+        );
+        let received = fixture
+            .receiver
+            .recv()
+            .await
+            .expect("should receive")
+            .into_text()
+            .expect("should be text");
+        let received = serde_json::from_str::<serde_json::Value>(&received)
+            .expect("should parse JSON successfully");
+        assert_eq!(
+            received,
+            json!({
+                "payload": {
+                    "Id": {
+                        "assigned": 1,
+                        "mesh": false
+                    }
+                }
+            })
+        );
+        let (socket2, mut fixture2) = TestSocket::new_pair();
+        let handler2_task = tokio::spawn(handle_websocket(socket2, state.clone()));
+
+        fixture2
+            .sender
+            .send(Ok(Message::Text(
+                serde_json::to_string(&InitialMessage::Join {
+                    name: lobby_name.to_string(),
+                })
+                .expect("should serialize successfully"),
+            )))
+            .expect("should succeed");
+        let received = fixture2
+            .receiver
+            .recv()
+            .await
+            .expect("should receive")
+            .into_text()
+            .expect("should be text");
+        let received = serde_json::from_str::<serde_json::Value>(&received)
+            .expect("should parse JSON successfully");
+        let peer_id = received["payload"]["Id"]["assigned"]
+            .as_u64()
+            .expect("should be int");
+        assert_eq!(
+            received,
+            json!({
+                "payload": {
+                    "Id": {
+                        "assigned": peer_id,
+                        "mesh": false
+                    }
+                }
+            })
+        );
+
+        drop(fixture);
+        drop(fixture2);
+        if let Some(lobby_join_handle) = handler_task
+            .await
+            .expect("should complete normally")
+            .expect("should not get error")
+        {
+            lobby_join_handle.await.expect("should complete normally");
+        }
+
+        assert!(state.lobbies.0.lobbies.is_empty());
+    }
 }

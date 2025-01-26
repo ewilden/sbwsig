@@ -13,6 +13,7 @@ use futures::StreamExt;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_stream::StreamMap;
 
 use crate::Socket;
@@ -294,7 +295,10 @@ impl<S: Socket> Lobbies<S> {
                             .chain(futures::stream::once(futures::future::ready(None))),
                     );
                     let peer = Peer::new(id, tx);
-                    lobby.join(peer).await?;
+                    lobby
+                        .join(peer)
+                        .await
+                        .context("failed to join new peer to lobby")?;
                 }
                 LobbyWorkItem::PeerMessage((id, opt_rx_result)) => {
                     match opt_rx_result {
@@ -303,7 +307,10 @@ impl<S: Socket> Lobbies<S> {
                             // Remove it from the map.
                             let _ = peer_rx.get_mut().remove(&id);
                             // We're leaving!
-                            let (close, _peer) = lobby.leave(id).await?;
+                            let (close, _peer) = lobby
+                                .leave(id)
+                                .await
+                                .context("failed to leave lobby with hung-up peer")?;
                             if let Some(CloseLobby) = close {
                                 // The lobby is closed, hang up on everybody.
                                 log::info!("closing lobby {}", lobby.name);
@@ -317,7 +324,10 @@ impl<S: Socket> Lobbies<S> {
                                 // Remove it from the map.
                                 let _ = peer_rx.get_mut().remove(&id);
                                 // We're leaving!
-                                let (close, _peer) = lobby.leave(id).await?;
+                                let (close, _peer) = lobby
+                                    .leave(id)
+                                    .await
+                                    .context("failed to leave lobby with errored peer")?;
                                 if let Some(CloseLobby) = close {
                                     // The lobby is closed, hang up on everybody.
                                     log::info!("closing lobby {}", lobby.name);
@@ -330,7 +340,10 @@ impl<S: Socket> Lobbies<S> {
                                     let relay_message: RelayMessage =
                                         serde_json::from_str(message.as_str())
                                             .context("failed to parse as RelayMessage")?;
-                                    lobby.relay(relay_message).await?;
+                                    lobby
+                                        .relay(relay_message)
+                                        .await
+                                        .context("failed to relay message")?;
                                 }
                                 Message::Binary(_vec) => {
                                     // Wrong! Hang up on the peer.
@@ -352,7 +365,7 @@ impl<S: Socket> Lobbies<S> {
         &self,
         peer: NewPeer<S>,
         mesh: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<JoinHandle<()>, Error> {
         let (name, vacant_entry) = loop {
             let name = Lobby::<S>::new_name();
             let entry = self.0.lobbies.entry_async(name.clone()).await;
@@ -367,7 +380,7 @@ impl<S: Socket> Lobbies<S> {
         let (sender, receiver) = mpsc::channel(32);
         vacant_entry.insert_entry(sender);
         let me = self.clone();
-        tokio::spawn(async move {
+        Ok(tokio::spawn(async move {
             match me
                 .new_lobby_task(name, peer.id, peer.websocket, mesh, receiver)
                 .await
@@ -377,8 +390,7 @@ impl<S: Socket> Lobbies<S> {
                     log::error!("lobby task exited with error {e:?}");
                 }
             }
-        });
-        Ok(())
+        }))
     }
 
     pub(crate) async fn handle_join_lobby(
