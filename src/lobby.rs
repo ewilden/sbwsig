@@ -376,10 +376,10 @@ impl<S: Socket> Lobbies<S> {
                 },
                 Err(err) => match err {
                     WorkItemErr::NonFatal(err) => {
-                        log::warn!("non-fatal error handling work item: {err:?}");
+                        log::info!("non-fatal error handling work item: {err:?}");
                     }
                     WorkItemErr::FatalForPeer(id, err) => {
-                        log::warn!("hanging up on peer {id} due to fatal error {err:?}");
+                        log::info!("hanging up on peer {id} due to fatal error {err:?}");
                         let _ = peer_rx.get_mut().remove(&id);
                         let result = lobby
                             .leave(id)
@@ -387,7 +387,7 @@ impl<S: Socket> Lobbies<S> {
                             .context("failed to leave lobby with errored peer");
                         let (close, _peer) = match result {
                             Err(e) => {
-                                log::error!("error leaving lobby with errored peer: {e:?}");
+                                log::warn!("error leaving lobby with errored peer: {e:?}");
                                 continue;
                             }
                             Ok(ok) => ok,
@@ -399,7 +399,7 @@ impl<S: Socket> Lobbies<S> {
                         }
                     }
                     WorkItemErr::FatalForLobby(err) => {
-                        log::warn!("closing lobby due to fatal error: {err:?}");
+                        log::info!("closing lobby due to fatal error: {err:?}");
                         return Ok(());
                     }
                 },
@@ -433,7 +433,7 @@ impl<S: Socket> Lobbies<S> {
             {
                 Ok(()) => (),
                 Err(e) => {
-                    log::error!("lobby task exited with error {e:?}");
+                    log::info!("lobby task exited with error {e:?}");
                 }
             }
         }))
