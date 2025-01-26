@@ -167,21 +167,27 @@ mod test {
 
     use super::*;
     use axum::extract::ws::Message;
+    use futures::FutureExt as _;
     use serde_json::json;
     use tokio::sync::mpsc;
 
     struct TestSocket {
+        name: &'static str,
         sender: mpsc::UnboundedSender<Message>,
         receiver: mpsc::UnboundedReceiver<Result<Message, axum::Error>>,
     }
 
     impl TestSocket {
-        fn new_pair() -> (Self, TestSocketOtherEnd) {
+        fn new_pair(name: &'static str) -> (Self, TestSocketOtherEnd) {
             let (sender, other_receiver) = mpsc::unbounded_channel();
             let (other_sender, receiver) = mpsc::unbounded_channel();
 
             (
-                TestSocket { sender, receiver },
+                TestSocket {
+                    name,
+                    sender,
+                    receiver,
+                },
                 TestSocketOtherEnd {
                     sender: other_sender,
                     receiver: other_receiver,
@@ -205,7 +211,7 @@ mod test {
             match self.receiver.poll_recv(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(received) => {
-                    eprintln!("test socket received: {received:#?}");
+                    eprintln!("test socket {} received: {received:#?}", self.name);
                     Poll::Ready(received)
                 }
             }
@@ -223,7 +229,7 @@ mod test {
         }
 
         fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-            eprintln!("test socket sending: {item:#?}");
+            eprintln!("test socket {} sending: {item:#?}", self.name);
             self.sender.send(item).map_err(|err| axum::Error::new(err))
         }
 
@@ -243,14 +249,14 @@ mod test {
     }
 
     fn _impls_socket() {
-        let (test_socket, _other_end) = TestSocket::new_pair();
+        let (test_socket, _other_end) = TestSocket::new_pair("host");
         let _socket: &dyn Socket = &test_socket;
     }
 
     #[tokio::test]
     async fn handles_open_close() {
         let state = Arc::new(State::new());
-        let (socket, fixture) = TestSocket::new_pair();
+        let (socket, fixture) = TestSocket::new_pair("host");
         let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
         drop(fixture);
         if let Some(join_handle) = handler_task
@@ -266,7 +272,7 @@ mod test {
     #[tokio::test]
     async fn basic_functionality() {
         let state = Arc::new(State::new());
-        let (socket, mut fixture) = TestSocket::new_pair();
+        let (socket, mut fixture) = TestSocket::new_pair("host");
         let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
         fixture
             .sender
@@ -317,8 +323,11 @@ mod test {
                 }
             })
         );
-        let (socket2, mut fixture2) = TestSocket::new_pair();
-        let handler2_task = tokio::spawn(handle_websocket(socket2, state.clone()));
+        let (socket2, mut fixture2) = TestSocket::new_pair("peer1");
+        let handler2_task = tokio::spawn(
+            handle_websocket(socket2, state.clone())
+                .map(|opt_handle| assert!(opt_handle.expect("should succeed").is_none())),
+        );
 
         fixture2
             .sender
@@ -329,6 +338,8 @@ mod test {
                 .expect("should serialize successfully"),
             )))
             .expect("should succeed");
+        handler2_task.await.expect("should complete normally");
+
         let received = fixture2
             .receiver
             .recv()
