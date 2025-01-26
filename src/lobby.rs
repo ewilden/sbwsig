@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::Message;
 use color_eyre::eyre::eyre;
 use color_eyre::eyre::Context as _;
 use color_eyre::eyre::Error;
 use derivative::Derivative;
 use futures::stream::SplitSink;
+use futures::stream::SplitStream;
 use futures::FutureExt as _;
 use futures::SinkExt as _;
 use futures::StreamExt;
@@ -131,6 +132,68 @@ impl<S: Socket> Lobby<S> {
         })
         .await
     }
+
+    async fn handle_work_item(
+        &mut self,
+        work_item: LobbyWorkItem<S>,
+    ) -> Result<WorkItemOk<S>, WorkItemErr> {
+        match work_item {
+            LobbyWorkItem::NewPeer(new_peer) => {
+                let NewPeer { websocket } = new_peer;
+                let (tx, rx) = websocket.split();
+                let id = self
+                    .join(tx, false /* is_host */)
+                    .await
+                    .context("failed to join new peer to lobby")
+                    .map_err(WorkItemErr::NonFatal)?;
+                Ok(WorkItemOk::InsertNewPeer(id, rx))
+            }
+            LobbyWorkItem::PeerMessage((id, opt_rx_result)) => {
+                match opt_rx_result {
+                    None => {
+                        // Peer hung up on us.
+                        // Remove it from the map.
+                        if id == 1 {
+                            Err(WorkItemErr::FatalForLobby(eyre!("host hung up")))
+                        } else {
+                            Err(WorkItemErr::FatalForPeer(id, eyre!("peer hung up")))
+                        }
+                    }
+                    Some(result) => match result {
+                        Err(e) => {
+                            let e = eyre!("error receiving message: {e:?}");
+                            if id == 1 {
+                                return Err(WorkItemErr::FatalForLobby(e));
+                            } else {
+                                return Err(WorkItemErr::FatalForPeer(id, e));
+                            }
+                        }
+                        Ok(message) => match message {
+                            Message::Text(message) => {
+                                // All remaining messages should be relay messages.
+                                let relay_message: RelayMessage =
+                                    serde_json::from_str(message.as_str())
+                                        .context("failed to parse as RelayMessage")
+                                        .map_err(|e| WorkItemErr::FatalForPeer(id, e))?;
+                                self.relay(relay_message)
+                                    .await
+                                    .context("failed to relay message")
+                                    .map_err(WorkItemErr::NonFatal)?;
+                                Ok(WorkItemOk::Noop)
+                            }
+                            Message::Binary(_vec) => Err(WorkItemErr::FatalForPeer(
+                                id,
+                                eyre!("should never get binary websocket message"),
+                            )),
+                            Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {
+                                Ok(WorkItemOk::Noop)
+                            }
+                        },
+                    },
+                }
+            }
+        }
+    }
 }
 
 /// If we receive this, we need to drain all the peers
@@ -232,6 +295,20 @@ impl<S: Socket> Drop for ClearLobbyOnDrop<S> {
 #[derivative(Clone(bound = ""))]
 pub(crate) struct Lobbies<S: Socket>(pub(crate) Arc<LobbiesInner<S>>);
 
+#[derive(Derivative)]
+#[derivative(Debug(bound = ""))]
+enum WorkItemOk<S: Socket> {
+    InsertNewPeer(u32, #[derivative(Debug = "ignore")] SplitStream<S>),
+    Noop,
+}
+
+#[derive(Debug)]
+enum WorkItemErr {
+    NonFatal(Error),
+    FatalForPeer(u32, Error),
+    FatalForLobby(Error),
+}
+
 impl<S: Socket> Lobbies<S> {
     async fn new_lobby_task(
         self,
@@ -284,90 +361,48 @@ impl<S: Socket> Lobbies<S> {
                     }
                 }
             };
-            match work_item {
-                LobbyWorkItem::NewPeer(new_peer) => {
-                    let NewPeer { websocket } = new_peer;
-                    let (tx, rx) = websocket.split();
-                    let id = lobby
-                        .join(tx, false /* is_host */)
-                        .await
-                        .context("failed to join new peer to lobby")?;
-                    peer_rx.get_mut().insert(
-                        id,
-                        rx.map(Some)
-                            .chain(futures::stream::once(futures::future::ready(None))),
-                    );
-                }
-                LobbyWorkItem::PeerMessage((id, opt_rx_result)) => {
-                    match opt_rx_result {
-                        None => {
-                            // Peer hung up on us.
-                            // Remove it from the map.
-                            let _ = peer_rx.get_mut().remove(&id);
-                            let result = lobby
-                                .leave(id)
-                                .await
-                                .context("failed to leave lobby with hung-up peer");
-                            let (close, _peer) = match result {
-                                Err(e) => {
-                                    log::error!("error leaving lobby with hung-up peer: {e:?}");
-                                    continue;
-                                }
-                                Ok(ok) => ok,
-                            };
 
-                            if let Some(CloseLobby) = close {
-                                // The lobby is closed, hang up on everybody.
-                                log::info!("closing lobby {}", lobby.name);
-                                return Ok(());
-                            }
-                        }
-                        Some(result) => match result {
-                            Err(e) => {
-                                log::error!("error receiving: {e:?}");
-                                // Peer errored.
-                                // Remove it from the map.
-                                let _ = peer_rx.get_mut().remove(&id);
-                                let result = lobby
-                                    .leave(id)
-                                    .await
-                                    .context("failed to leave lobby with errored peer");
-                                let (close, _peer) = match result {
-                                    Err(e) => {
-                                        log::error!("error leaving lobby with errored peer: {e:?}");
-                                        continue;
-                                    }
-                                    Ok(ok) => ok,
-                                };
-                                if let Some(CloseLobby) = close {
-                                    // The lobby is closed, hang up on everybody.
-                                    log::info!("closing lobby {}", lobby.name);
-                                    return Ok(());
-                                }
-                            }
-                            Ok(message) => match message {
-                                Message::Text(message) => {
-                                    // All remaining messages should be relay messages.
-                                    let relay_message: RelayMessage =
-                                        serde_json::from_str(message.as_str())
-                                            .context("failed to parse as RelayMessage")?;
-                                    lobby
-                                        .relay(relay_message)
-                                        .await
-                                        .context("failed to relay message")?;
-                                }
-                                Message::Binary(_vec) => {
-                                    // Wrong! Hang up on the peer.
-                                    // For now just ignore.
-                                    log::debug!("ignoring binary msg")
-                                }
-                                Message::Ping(_) => (),
-                                Message::Pong(_) => (),
-                                Message::Close(_) => (),
-                            },
-                        },
+            let result = lobby.handle_work_item(work_item).await;
+            match result {
+                Ok(ok) => match ok {
+                    WorkItemOk::InsertNewPeer(id, rx) => {
+                        peer_rx.get_mut().insert(
+                            id,
+                            rx.map(Some)
+                                .chain(futures::stream::once(futures::future::ready(None))),
+                        );
                     }
-                }
+                    WorkItemOk::Noop => (),
+                },
+                Err(err) => match err {
+                    WorkItemErr::NonFatal(err) => {
+                        log::warn!("non-fatal error handling work item: {err:?}");
+                    }
+                    WorkItemErr::FatalForPeer(id, err) => {
+                        log::warn!("hanging up on peer {id} due to fatal error {err:?}");
+                        let _ = peer_rx.get_mut().remove(&id);
+                        let result = lobby
+                            .leave(id)
+                            .await
+                            .context("failed to leave lobby with errored peer");
+                        let (close, _peer) = match result {
+                            Err(e) => {
+                                log::error!("error leaving lobby with errored peer: {e:?}");
+                                continue;
+                            }
+                            Ok(ok) => ok,
+                        };
+                        if let Some(CloseLobby) = close {
+                            // The lobby is closed, hang up on everybody.
+                            log::info!("closing lobby {}", lobby.name);
+                            return Ok(());
+                        }
+                    }
+                    WorkItemErr::FatalForLobby(err) => {
+                        log::warn!("closing lobby due to fatal error: {err:?}");
+                        return Ok(());
+                    }
+                },
             }
         }
     }
