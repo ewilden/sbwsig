@@ -38,7 +38,6 @@ impl<S: Socket> Peer<S> {
 
 pub(crate) struct Lobby<S: Socket> {
     name: String,
-    host: u32,
     mesh: bool,
     peers: BTreeMap<u32, Peer<S>>,
 }
@@ -52,25 +51,24 @@ impl<S: Socket> Lobby<S> {
             .collect::<String>()
     }
 
-    fn new(name: String, host: u32, mesh: bool) -> Self {
+    fn new(name: String, mesh: bool) -> Self {
         Lobby {
             name,
-            host,
             mesh,
             peers: Default::default(),
         }
     }
-    fn get_peer_id(host: u32, peer: &Peer<S>) -> u32 {
-        if host == peer.id {
-            1
-        } else {
-            peer.id
-        }
+    fn get_peer_id(peer: &Peer<S>) -> u32 {
+        peer.id
     }
 
-    async fn join(&mut self, mut new_peer: Peer<S>) -> Result<(), Error> {
-        let host = self.host;
-        let assigned = Self::get_peer_id(host, &new_peer);
+    async fn join(&mut self, new_peer: SplitSink<S, Message>, is_host: bool) -> Result<u32, Error> {
+        let assigned = if is_host {
+            1
+        } else {
+            self.peers.keys().copied().max().unwrap_or(1u32) + 1
+        };
+        let mut new_peer = Peer::new(assigned, new_peer);
         new_peer
             .send(&LobbyMessage {
                 payload: LobbyPayload::Id {
@@ -87,24 +85,23 @@ impl<S: Socket> Lobby<S> {
             new_peer
                 .send(&LobbyMessage {
                     payload: LobbyPayload::PeerConnect {
-                        peer_id: Self::get_peer_id(host, peer),
+                        peer_id: Self::get_peer_id(peer),
                     },
                 })
                 .await?;
         }
         self.peers.insert(new_peer.id, new_peer);
-        Ok(())
+        Ok(assigned)
     }
 
     async fn leave(&mut self, peer_id: u32) -> Result<(Option<CloseLobby>, Peer<S>), Error> {
-        let host = self.host;
         let Some(leaving_peer) = self.peers.remove(&peer_id) else {
             return Err(eyre!(
                 "peer {peer_id} tried to leave lobby {} without being in it",
                 self.name
             ));
         };
-        let assigned = Self::get_peer_id(host, &leaving_peer);
+        let assigned = Self::get_peer_id(&leaving_peer);
         let close = assigned == 1;
         if close {
             return Ok((Some(CloseLobby), leaving_peer));
@@ -126,7 +123,6 @@ impl<S: Socket> Lobby<S> {
             dest_id,
             data,
         } = relay_message;
-        let dest_id = if dest_id == 1 { self.host } else { dest_id };
         let Some(peer) = self.peers.get_mut(&dest_id) else {
             return Err(eyre!("no such peer {dest_id} to relay to"));
         };
@@ -191,7 +187,6 @@ pub(crate) struct RelayMessage {
 }
 
 pub(crate) struct NewPeer<S: Socket> {
-    pub(crate) id: u32,
     pub(crate) websocket: S,
 }
 
@@ -241,12 +236,17 @@ impl<S: Socket> Lobbies<S> {
     async fn new_lobby_task(
         self,
         name: String,
-        host_id: u32,
         host_ws: S,
         mesh: bool,
         mut peer_receiver: mpsc::Receiver<NewPeer<S>>,
     ) -> Result<(), Error> {
-        let mut lobby = Lobby::new(name, host_id, mesh);
+        let _cleanup = ClearLobbyOnDrop {
+            lobbies: self.clone(),
+            lobby_name: name.clone(),
+        };
+
+        let host_id = 1;
+        let mut lobby = Lobby::new(name, mesh);
         let mut peer_rx = StreamMap::<u32, _>::new().fuse();
         let (host_tx, host_rx) = host_ws.split();
         peer_rx.get_mut().insert(
@@ -262,12 +262,11 @@ impl<S: Socket> Lobbies<S> {
             },
         })
         .await?;
-        lobby.join(host).await?;
-
-        let _cleanup = ClearLobbyOnDrop {
-            lobbies: self.clone(),
-            lobby_name: lobby.name.clone(),
-        };
+        let Peer {
+            id: _host_id,
+            websocket: host_tx,
+        } = host;
+        lobby.join(host_tx, true /* is_host */).await?;
 
         loop {
             let work_item = {
@@ -287,18 +286,17 @@ impl<S: Socket> Lobbies<S> {
             };
             match work_item {
                 LobbyWorkItem::NewPeer(new_peer) => {
-                    let NewPeer { id, websocket } = new_peer;
+                    let NewPeer { websocket } = new_peer;
                     let (tx, rx) = websocket.split();
+                    let id = lobby
+                        .join(tx, false /* is_host */)
+                        .await
+                        .context("failed to join new peer to lobby")?;
                     peer_rx.get_mut().insert(
                         id,
                         rx.map(Some)
                             .chain(futures::stream::once(futures::future::ready(None))),
                     );
-                    let peer = Peer::new(id, tx);
-                    lobby
-                        .join(peer)
-                        .await
-                        .context("failed to join new peer to lobby")?;
                 }
                 LobbyWorkItem::PeerMessage((id, opt_rx_result)) => {
                     match opt_rx_result {
@@ -306,11 +304,18 @@ impl<S: Socket> Lobbies<S> {
                             // Peer hung up on us.
                             // Remove it from the map.
                             let _ = peer_rx.get_mut().remove(&id);
-                            // We're leaving!
-                            let (close, _peer) = lobby
+                            let result = lobby
                                 .leave(id)
                                 .await
-                                .context("failed to leave lobby with hung-up peer")?;
+                                .context("failed to leave lobby with hung-up peer");
+                            let (close, _peer) = match result {
+                                Err(e) => {
+                                    log::error!("error leaving lobby with hung-up peer: {e:?}");
+                                    continue;
+                                }
+                                Ok(ok) => ok,
+                            };
+
                             if let Some(CloseLobby) = close {
                                 // The lobby is closed, hang up on everybody.
                                 log::info!("closing lobby {}", lobby.name);
@@ -323,11 +328,17 @@ impl<S: Socket> Lobbies<S> {
                                 // Peer errored.
                                 // Remove it from the map.
                                 let _ = peer_rx.get_mut().remove(&id);
-                                // We're leaving!
-                                let (close, _peer) = lobby
+                                let result = lobby
                                     .leave(id)
                                     .await
-                                    .context("failed to leave lobby with errored peer")?;
+                                    .context("failed to leave lobby with errored peer");
+                                let (close, _peer) = match result {
+                                    Err(e) => {
+                                        log::error!("error leaving lobby with errored peer: {e:?}");
+                                        continue;
+                                    }
+                                    Ok(ok) => ok,
+                                };
                                 if let Some(CloseLobby) = close {
                                     // The lobby is closed, hang up on everybody.
                                     log::info!("closing lobby {}", lobby.name);
@@ -382,7 +393,7 @@ impl<S: Socket> Lobbies<S> {
         let me = self.clone();
         Ok(tokio::spawn(async move {
             match me
-                .new_lobby_task(name, peer.id, peer.websocket, mesh, receiver)
+                .new_lobby_task(name, peer.websocket, mesh, receiver)
                 .await
             {
                 Ok(()) => (),

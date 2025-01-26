@@ -27,7 +27,6 @@ use lobby::{CleanupWorkItem, InitialMessage, Lobbies, LobbiesInner};
 
 struct State<S: Socket> {
     lobbies: Lobbies<S>,
-    peer_ids: scc::HashSet<u32>,
     _cleanup_work: tokio::task::JoinHandle<()>,
 }
 
@@ -40,7 +39,6 @@ impl<S: Socket> State<S> {
         }));
         Self {
             lobbies: lobbies.clone(),
-            peer_ids: Default::default(),
             _cleanup_work: tokio::spawn(async move {
                 while let Some(work) = receiver.recv().await {
                     match work {
@@ -50,16 +48,6 @@ impl<S: Socket> State<S> {
                     }
                 }
             }),
-        }
-    }
-
-    fn allocate_peer(&self) -> u32 {
-        loop {
-            let peer_id = rand::random::<u32>();
-            match self.peer_ids.insert(peer_id) {
-                Ok(()) => return peer_id,
-                Err(_) => continue,
-            }
         }
     }
 }
@@ -126,11 +114,7 @@ async fn handle_websocket<S: Socket>(
             .context("failed to parse initial message")?;
     };
 
-    let peer_id = state.allocate_peer();
-    let peer = lobby::NewPeer {
-        id: peer_id,
-        websocket: socket,
-    };
+    let peer = lobby::NewPeer { websocket: socket };
 
     Ok(match initial_message {
         InitialMessage::Create { mesh } => {
@@ -374,6 +358,105 @@ mod test {
             lobby_join_handle.await.expect("should complete normally");
         }
 
+        assert!(state.lobbies.0.lobbies.is_empty());
+    }
+    #[tokio::test]
+    async fn test_multiple_peers() {
+        let state = Arc::new(State::new());
+        let (socket_host, mut fixture_host) = TestSocket::new_pair("host");
+        let handler_task = tokio::spawn(handle_websocket(socket_host, state.clone()));
+
+        // Create lobby
+        fixture_host
+            .sender
+            .send(Ok(Message::Text(
+                serde_json::to_string(&InitialMessage::Create { mesh: true })
+                    .expect("should serialize successfully"),
+            )))
+            .expect("should succeed");
+
+        let received = fixture_host
+            .receiver
+            .recv()
+            .await
+            .expect("should receive")
+            .into_text()
+            .expect("should be text");
+        let received = serde_json::from_str::<serde_json::Value>(&received)
+            .expect("should parse JSON successfully");
+        let lobby_name = received["payload"]["CreatedLobby"]["name"]
+            .as_str()
+            .expect("should be string");
+
+        let peer_names = ["peer0", "peer1", "peer2", "peer3"];
+
+        // Connect 3 peers
+        for i in 1..=3 {
+            let (socket_peer, mut fixture_peer) = TestSocket::new_pair(peer_names[i]);
+            let peer_handler = tokio::spawn(
+                handle_websocket(socket_peer, state.clone())
+                    .map(|opt_handle| assert!(opt_handle.expect("should succeed").is_none())),
+            );
+
+            fixture_peer
+                .sender
+                .send(Ok(Message::Text(
+                    serde_json::to_string(&InitialMessage::Join {
+                        name: lobby_name.to_string(),
+                    })
+                    .expect("should serialize successfully"),
+                )))
+                .expect("should succeed");
+
+            peer_handler.await.expect("should complete normally");
+            drop(fixture_peer);
+        }
+
+        drop(fixture_host);
+        if let Some(lobby_join_handle) = handler_task
+            .await
+            .expect("should complete normally")
+            .expect("should not get error")
+        {
+            lobby_join_handle.await.expect("should complete normally");
+        }
+
+        assert!(state.lobbies.0.lobbies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_initial_message() {
+        let state = Arc::new(State::new());
+        let (socket, mut fixture) = TestSocket::new_pair("test");
+        let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
+
+        // Send invalid JSON
+        fixture
+            .sender
+            .send(Ok(Message::Text("invalid json".to_string())))
+            .expect("should succeed");
+
+        assert!(handler_task.await.unwrap().is_err());
+        assert!(state.lobbies.0.lobbies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_join_nonexistent_lobby() {
+        let state = Arc::new(State::new());
+        let (socket, mut fixture) = TestSocket::new_pair("test");
+        let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
+
+        fixture
+            .sender
+            .send(Ok(Message::Text(
+                serde_json::to_string(&InitialMessage::Join {
+                    name: "nonexistent".to_string(),
+                })
+                .expect("should serialize successfully"),
+            )))
+            .expect("should succeed");
+
+        assert!(handler_task.await.unwrap().is_err());
         assert!(state.lobbies.0.lobbies.is_empty());
     }
 }
