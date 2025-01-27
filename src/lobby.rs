@@ -71,23 +71,17 @@ impl<S: Socket> Lobby<S> {
         };
         let mut new_peer = Peer::new(assigned, new_peer);
         new_peer
-            .send(&LobbyMessage {
-                payload: LobbyPayload::Id {
-                    assigned,
-                    mesh: self.mesh,
-                },
+            .send(&LobbyMessage::Id {
+                assigned,
+                mesh: self.mesh,
             })
             .await?;
         for (_, peer) in &mut self.peers {
-            peer.send(&LobbyMessage {
-                payload: LobbyPayload::PeerConnect { peer_id: assigned },
-            })
-            .await?;
+            peer.send(&LobbyMessage::PeerConnect { peer_id: assigned })
+                .await?;
             new_peer
-                .send(&LobbyMessage {
-                    payload: LobbyPayload::PeerConnect {
-                        peer_id: Self::get_peer_id(peer),
-                    },
+                .send(&LobbyMessage::PeerConnect {
+                    peer_id: Self::get_peer_id(peer),
                 })
                 .await?;
         }
@@ -109,10 +103,8 @@ impl<S: Socket> Lobby<S> {
         }
 
         for (_, peer) in &mut self.peers {
-            peer.send(&LobbyMessage {
-                payload: LobbyPayload::PeerDisconnect { peer_id: assigned },
-            })
-            .await?;
+            peer.send(&LobbyMessage::PeerDisconnect { peer_id: assigned })
+                .await?;
         }
 
         Ok((None, leaving_peer))
@@ -127,10 +119,8 @@ impl<S: Socket> Lobby<S> {
         let Some(peer) = self.peers.get_mut(&dest_id) else {
             return Err(eyre!("no such peer {dest_id} to relay to"));
         };
-        peer.send(&LobbyMessage {
-            payload: LobbyPayload::RelayedMessage { kind, data },
-        })
-        .await
+        peer.send(&LobbyMessage::RelayedMessage { kind, data })
+            .await
     }
 
     async fn handle_work_item(
@@ -202,12 +192,8 @@ impl<S: Socket> Lobby<S> {
 struct CloseLobby;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct LobbyMessage {
-    payload: LobbyPayload,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-enum LobbyPayload {
+#[serde(tag = "kind", content = "payload")]
+enum LobbyMessage {
     Id {
         assigned: u32,
         mesh: bool,
@@ -253,8 +239,10 @@ pub(crate) struct NewPeer<S: Socket> {
     pub(crate) websocket: S,
 }
 
+#[derive(Derivative)]
+#[derivative(Debug(bound = ""))]
 enum LobbyWorkItem<S: Socket> {
-    NewPeer(NewPeer<S>),
+    NewPeer(#[derivative(Debug = "ignore")] NewPeer<S>),
     PeerMessage((u32, Option<Result<Message, axum::Error>>)),
 }
 
@@ -333,10 +321,8 @@ impl<S: Socket> Lobbies<S> {
                 .chain(futures::stream::once(futures::future::ready(None))),
         );
         let mut host = Peer::new(host_id, host_tx);
-        host.send(&LobbyMessage {
-            payload: LobbyPayload::CreatedLobby {
-                name: lobby.name.clone(),
-            },
+        host.send(&LobbyMessage::CreatedLobby {
+            name: lobby.name.clone(),
         })
         .await?;
         let Peer {
@@ -361,6 +347,7 @@ impl<S: Socket> Lobbies<S> {
                     }
                 }
             };
+            log::debug!("work item: {work_item:?}");
 
             let result = lobby.handle_work_item(work_item).await;
             match result {

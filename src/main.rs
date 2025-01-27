@@ -207,7 +207,7 @@ mod test {
 
         fn poll_ready(
             self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
+            _cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
@@ -235,6 +235,13 @@ mod test {
     fn _impls_socket() {
         let (test_socket, _other_end) = TestSocket::new_pair("host");
         let _socket: &dyn Socket = &test_socket;
+    }
+
+    #[test]
+    fn aaaaa_init_logging() {
+        env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Trace)
+            .init();
     }
 
     #[tokio::test]
@@ -274,16 +281,15 @@ mod test {
             .expect("should be text");
         let received = serde_json::from_str::<serde_json::Value>(&received)
             .expect("should parse JSON successfully");
-        let lobby_name = received["payload"]["CreatedLobby"]["name"]
+        let lobby_name = received["payload"]["name"]
             .as_str()
             .expect("should be string");
         assert_eq!(
             received,
             json!({
+                "kind": "CreatedLobby",
                 "payload": {
-                    "CreatedLobby": {
                         "name": lobby_name
-                    }
                 }
             })
         );
@@ -299,11 +305,10 @@ mod test {
         assert_eq!(
             received,
             json!({
+                "kind": "Id",
                 "payload": {
-                    "Id": {
                         "assigned": 1,
                         "mesh": false
-                    }
                 }
             })
         );
@@ -333,17 +338,16 @@ mod test {
             .expect("should be text");
         let received = serde_json::from_str::<serde_json::Value>(&received)
             .expect("should parse JSON successfully");
-        let peer_id = received["payload"]["Id"]["assigned"]
+        let peer_id = received["payload"]["assigned"]
             .as_u64()
             .expect("should be int");
         assert_eq!(
             received,
             json!({
+                "kind": "Id",
                 "payload": {
-                    "Id": {
                         "assigned": peer_id,
                         "mesh": false
-                    }
                 }
             })
         );
@@ -362,6 +366,10 @@ mod test {
     }
     #[tokio::test]
     async fn test_multiple_peers() {
+        let _: Result<_, _> = env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Trace)
+            .try_init();
+
         let state = Arc::new(State::new());
         let (socket_host, mut fixture_host) = TestSocket::new_pair("host");
         let handler_task = tokio::spawn(handle_websocket(socket_host, state.clone()));
@@ -384,7 +392,7 @@ mod test {
             .expect("should be text");
         let received = serde_json::from_str::<serde_json::Value>(&received)
             .expect("should parse JSON successfully");
-        let lobby_name = received["payload"]["CreatedLobby"]["name"]
+        let lobby_name = received["payload"]["name"]
             .as_str()
             .expect("should be string");
 
@@ -408,6 +416,33 @@ mod test {
                 )))
                 .expect("should succeed");
 
+            // Receive assigned ID from server
+            let received = fixture_peer
+                .receiver
+                .recv()
+                .await
+                .expect("should receive")
+                .into_text()
+                .expect("should be text");
+            let received = serde_json::from_str::<serde_json::Value>(&received)
+                .expect("should parse JSON successfully");
+            assert!(received["payload"]["assigned"].is_number());
+
+            // Test message relay
+            fixture_peer
+                .sender
+                .send(Ok(Message::Text(
+                    serde_json::json!({
+                        "kind": "Offer",
+                        "dest_id": 1,
+                        "data": "hello!"
+                    })
+                    .to_string(),
+                )))
+                .expect("should succeed");
+
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
             peer_handler.await.expect("should complete normally");
             drop(fixture_peer);
         }
@@ -427,7 +462,7 @@ mod test {
     #[tokio::test]
     async fn test_invalid_initial_message() {
         let state = Arc::new(State::new());
-        let (socket, mut fixture) = TestSocket::new_pair("test");
+        let (socket, fixture) = TestSocket::new_pair("test");
         let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
 
         // Send invalid JSON
@@ -443,7 +478,7 @@ mod test {
     #[tokio::test]
     async fn test_join_nonexistent_lobby() {
         let state = Arc::new(State::new());
-        let (socket, mut fixture) = TestSocket::new_pair("test");
+        let (socket, fixture) = TestSocket::new_pair("test");
         let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
 
         fixture
