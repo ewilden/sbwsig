@@ -196,6 +196,12 @@ mod test {
                 .expect("should be text");
             serde_json::from_str(received.as_str()).expect("should be JSON object")
         }
+
+        fn send(&self, value: serde_json::Value) {
+            self.sender
+                .send(Ok(Message::Text(value.to_string())))
+                .expect("should succeed");
+        }
     }
 
     impl Stream for TestSocket {
@@ -278,22 +284,13 @@ mod test {
         let state = Arc::new(State::new());
         let (socket, mut fixture) = TestSocket::new_pair("host");
         let handler_task = tokio::spawn(handle_websocket(socket, state.clone()));
-        fixture
-            .sender
-            .send(Ok(Message::Text(
-                serde_json::to_string(&InitialMessage::Create { mesh: false })
-                    .expect("should serialize successfully"),
-            )))
-            .expect("should succeed");
-        let received = fixture
-            .receiver
-            .recv()
-            .await
-            .expect("should receive")
-            .into_text()
-            .expect("should be text");
-        let received = serde_json::from_str::<serde_json::Value>(&received)
-            .expect("should parse JSON successfully");
+        fixture.send(json!({
+            "kind": "Create",
+            "payload": {
+                "mesh": false
+            }
+        }));
+        let received = fixture.recv().await;
         let lobby_name = received["payload"]["name"]
             .as_str()
             .expect("should be string");
@@ -306,15 +303,7 @@ mod test {
                 }
             })
         );
-        let received = fixture
-            .receiver
-            .recv()
-            .await
-            .expect("should receive")
-            .into_text()
-            .expect("should be text");
-        let received = serde_json::from_str::<serde_json::Value>(&received)
-            .expect("should parse JSON successfully");
+        let received = fixture.recv().await;
         assert_eq!(
             received,
             json!({
@@ -330,27 +319,15 @@ mod test {
             handle_websocket(socket2, state.clone())
                 .map(|opt_handle| assert!(opt_handle.expect("should succeed").is_none())),
         );
-
-        fixture2
-            .sender
-            .send(Ok(Message::Text(
-                serde_json::to_string(&InitialMessage::Join {
-                    name: lobby_name.to_string(),
-                })
-                .expect("should serialize successfully"),
-            )))
-            .expect("should succeed");
+        fixture2.send(json!({
+            "kind": "Join",
+            "payload": {
+                "name": lobby_name,
+            }
+        }));
         handler2_task.await.expect("should complete normally");
 
-        let received = fixture2
-            .receiver
-            .recv()
-            .await
-            .expect("should receive")
-            .into_text()
-            .expect("should be text");
-        let received = serde_json::from_str::<serde_json::Value>(&received)
-            .expect("should parse JSON successfully");
+        let received = fixture2.recv().await;
         let peer_id = received["payload"]["assigned"]
             .as_u64()
             .expect("should be int");
@@ -359,8 +336,8 @@ mod test {
             json!({
                 "kind": "Id",
                 "payload": {
-                        "assigned": peer_id,
-                        "mesh": false
+                    "assigned": peer_id,
+                    "mesh": false
                 }
             })
         );
@@ -389,13 +366,12 @@ mod test {
         let handler_task = tokio::spawn(handle_websocket(socket_host, state.clone()));
 
         // Create lobby
-        fixture_host
-            .sender
-            .send(Ok(Message::Text(
-                serde_json::to_string(&InitialMessage::Create { mesh: true })
-                    .expect("should serialize successfully"),
-            )))
-            .expect("should succeed");
+        fixture_host.send(json!({
+            "kind": "Create",
+            "payload": {
+                "mesh": true
+            }
+        }));
 
         let received = fixture_host.recv().await;
         let lobby_name = received["payload"]["name"]
@@ -433,42 +409,25 @@ mod test {
                     .map(|opt_handle| assert!(opt_handle.expect("should succeed").is_none())),
             );
 
-            fixture_peer
-                .sender
-                .send(Ok(Message::Text(
-                    serde_json::to_string(&InitialMessage::Join {
-                        name: lobby_name.to_string(),
-                    })
-                    .expect("should serialize successfully"),
-                )))
-                .expect("should succeed");
+            fixture_peer.send(json!({
+                "kind": "Join",
+                "payload": {
+                    "name": lobby_name,
+                }
+            }));
 
             // Receive assigned ID from server
-            let received = fixture_peer
-                .receiver
-                .recv()
-                .await
-                .expect("should receive")
-                .into_text()
-                .expect("should be text");
-            let received = serde_json::from_str::<serde_json::Value>(&received)
-                .expect("should parse JSON successfully");
+            let received = fixture_peer.recv().await;
             assert!(received["payload"]["assigned"].is_number());
 
             peer_handler.await.expect("should complete normally");
 
             // Test message relay
-            fixture_peer
-                .sender
-                .send(Ok(Message::Text(
-                    serde_json::json!({
-                        "kind": "Offer",
-                        "dest_id": 1,
-                        "data": "hello!"
-                    })
-                    .to_string(),
-                )))
-                .expect("should succeed");
+            fixture_peer.send(json!({
+                "kind": "Offer",
+                "dest_id": 1,
+                "data": "hello!"
+            }));
             let received = fixture_host.recv().await;
             assert_eq!(
                 received,

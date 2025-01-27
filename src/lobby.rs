@@ -449,6 +449,7 @@ impl<S: Socket> Lobbies<S> {
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", content = "payload")]
 pub(crate) enum InitialMessage {
     Create { mesh: bool },
     Join { name: String },
