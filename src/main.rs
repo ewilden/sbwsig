@@ -397,18 +397,19 @@ mod test {
             )))
             .expect("should succeed");
 
-        let received = fixture_host
-            .receiver
-            .recv()
-            .await
-            .expect("should receive")
-            .into_text()
-            .expect("should be text");
-        let received = serde_json::from_str::<serde_json::Value>(&received)
-            .expect("should parse JSON successfully");
+        let received = fixture_host.recv().await;
         let lobby_name = received["payload"]["name"]
             .as_str()
             .expect("should be string");
+        assert_eq!(
+            received,
+            json!({
+                "kind": "CreatedLobby",
+                "payload": {
+                    "name": lobby_name,
+                }
+            })
+        );
 
         let received = fixture_host.recv().await;
         assert_eq!(
