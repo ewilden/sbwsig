@@ -41,6 +41,7 @@ pub(crate) struct Lobby<S: Socket> {
     name: String,
     mesh: bool,
     peers: BTreeMap<u32, Peer<S>>,
+    next_id: u32,
 }
 
 impl<S: Socket> Lobby<S> {
@@ -57,6 +58,7 @@ impl<S: Socket> Lobby<S> {
             name,
             mesh,
             peers: Default::default(),
+            next_id: 2,
         }
     }
     fn get_peer_id(peer: &Peer<S>) -> u32 {
@@ -67,7 +69,9 @@ impl<S: Socket> Lobby<S> {
         let assigned = if is_host {
             1
         } else {
-            self.peers.keys().copied().max().unwrap_or(1u32) + 1
+            let id = self.next_id;
+            self.next_id += 1;
+            id
         };
         let mut new_peer = Peer::new(assigned, new_peer);
         new_peer

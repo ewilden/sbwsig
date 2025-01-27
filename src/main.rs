@@ -185,6 +185,19 @@ mod test {
         receiver: mpsc::UnboundedReceiver<Message>,
     }
 
+    impl TestSocketOtherEnd {
+        async fn recv(&mut self) -> serde_json::Value {
+            let received = self
+                .receiver
+                .recv()
+                .await
+                .expect("should receive")
+                .into_text()
+                .expect("should be text");
+            serde_json::from_str(received.as_str()).expect("should be JSON object")
+        }
+    }
+
     impl Stream for TestSocket {
         type Item = Result<Message, axum::Error>;
 
@@ -364,6 +377,7 @@ mod test {
 
         assert!(state.lobbies.0.lobbies.is_empty());
     }
+
     #[tokio::test]
     async fn test_multiple_peers() {
         let _: Result<_, _> = env_logger::Builder::new()
@@ -395,6 +409,18 @@ mod test {
         let lobby_name = received["payload"]["name"]
             .as_str()
             .expect("should be string");
+
+        let received = fixture_host.recv().await;
+        assert_eq!(
+            received,
+            json!({
+                "kind": "Id",
+                "payload": {
+                    "assigned": 1,
+                    "mesh": true,
+                }
+            })
+        );
 
         let peer_names = ["peer0", "peer1", "peer2", "peer3"];
 
@@ -428,6 +454,8 @@ mod test {
                 .expect("should parse JSON successfully");
             assert!(received["payload"]["assigned"].is_number());
 
+            peer_handler.await.expect("should complete normally");
+
             // Test message relay
             fixture_peer
                 .sender
@@ -440,11 +468,38 @@ mod test {
                     .to_string(),
                 )))
                 .expect("should succeed");
-
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-            peer_handler.await.expect("should complete normally");
+            let received = fixture_host.recv().await;
+            assert_eq!(
+                received,
+                json!({
+                    "kind": "PeerConnect",
+                    "payload": {
+                        "peer_id": i + 1,
+                    }
+                })
+            );
+            let received = fixture_host.recv().await;
+            assert_eq!(
+                received,
+                json!({
+                    "kind": "RelayedMessage",
+                    "payload": {
+                        "kind": "Offer",
+                        "data": "hello!",
+                    }
+                })
+            );
             drop(fixture_peer);
+            let received = fixture_host.recv().await;
+            assert_eq!(
+                received,
+                json!({
+                    "kind": "PeerDisconnect",
+                    "payload": {
+                        "peer_id": i + 1,
+                    }
+                })
+            );
         }
 
         drop(fixture_host);
