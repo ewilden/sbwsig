@@ -446,6 +446,7 @@ mod test {
                     "payload": {
                         "kind": "Offer",
                         "data": "hello!",
+                        "peer_id": i + 1,
                     }
                 })
             );

@@ -114,7 +114,7 @@ impl<S: Socket> Lobby<S> {
         Ok((None, leaving_peer))
     }
 
-    async fn relay(&mut self, relay_message: RelayMessage) -> Result<(), Error> {
+    async fn relay(&mut self, relay_message: RelayMessage, src_id: u32) -> Result<(), Error> {
         let RelayMessage {
             kind,
             dest_id,
@@ -123,8 +123,12 @@ impl<S: Socket> Lobby<S> {
         let Some(peer) = self.peers.get_mut(&dest_id) else {
             return Err(eyre!("no such peer {dest_id} to relay to"));
         };
-        peer.send(&LobbyMessage::RelayedMessage { kind, data })
-            .await
+        peer.send(&LobbyMessage::RelayedMessage {
+            kind,
+            data,
+            peer_id: src_id,
+        })
+        .await
     }
 
     async fn handle_work_item(
@@ -169,7 +173,7 @@ impl<S: Socket> Lobby<S> {
                                     serde_json::from_str(message.as_str())
                                         .context("failed to parse as RelayMessage")
                                         .map_err(|e| WorkItemErr::FatalForPeer(id, e))?;
-                                self.relay(relay_message)
+                                self.relay(relay_message, id)
                                     .await
                                     .context("failed to relay message")
                                     .map_err(WorkItemErr::NonFatal)?;
@@ -216,6 +220,7 @@ enum LobbyMessage {
     RelayedMessage {
         kind: RelayMessageKind,
         data: String,
+        peer_id: u32,
     },
 }
 
