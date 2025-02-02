@@ -99,10 +99,12 @@ async fn handle_websocket<S: Socket>(
 ) -> Result<Option<JoinHandle<()>>, Error> {
     log::info!("handle_websocket");
     let initial_message = loop {
-        let message = match socket.next().await {
-            None => return Ok(None),
-            Some(result) => result.context("error receiving initial message")?,
-        };
+        let message =
+            match tokio::time::timeout(std::time::Duration::from_secs(5), socket.next()).await {
+                Ok(None) => return Ok(None),
+                Ok(Some(result)) => result.context("error receiving initial message")?,
+                Err(e) => return Err(eyre!("timed out receiving initial message: {e:?}")),
+            };
         let message = match message {
             Message::Text(message) => message,
             Message::Binary(_) => return Err(eyre!("expecting text message")),
