@@ -66,10 +66,33 @@ async fn main() -> ShuttleAxum {
 
     let router = Router::new()
         .route("/websocket", get(websocket_handler))
-        .nest_service("/", ServeDir::new("static"))
+        // .nest_service("/", ServeDir::new("static"))
+        .route("/", get(handle_get_status))
         .layer(Extension(state));
 
     Ok(router.into())
+}
+
+async fn handle_get_status(
+    Extension(state): Extension<Arc<State<WebSocket>>>,
+) -> axum::response::Html<String> {
+    let prefix = r#"
+    <!doctype html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Status</title>
+    </head>
+    <body>"#;
+    let suffix = r#"</body>
+</html>"#;
+    let count = state.lobbies.0.lobbies.len();
+
+    axum::response::Html::from(format!(
+        "{prefix}<p>Currently, there are {count} lobbies.</p>{suffix}"
+    ))
 }
 
 async fn websocket_handler(
