@@ -44,11 +44,14 @@ pub(crate) struct Lobby<S: Socket> {
     next_id: u32,
 }
 
+const AMBIGUOUS_CHARACTERS: &[char] = &['0', 'O', 'l', '1'];
+
 impl<S: Socket> Lobby<S> {
     fn new_name() -> String {
         rand::thread_rng()
             .sample_iter(&Alphanumeric)
-            .take(16)
+            .filter(|c| !AMBIGUOUS_CHARACTERS.contains(&(*c as char)))
+            .take(6)
             .map(char::from)
             .collect::<String>()
     }
